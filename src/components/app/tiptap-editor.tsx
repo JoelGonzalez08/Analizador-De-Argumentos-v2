@@ -3,6 +3,7 @@
 import { useEditor, EditorContent, Editor } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Highlight from '@tiptap/extension-highlight';
+import { useEffect } from 'react';
 import {
   Tooltip,
   TooltipContent,
@@ -128,6 +129,7 @@ export function TiptapEditor({ content, onContentChange, disabled, onEditorReady
       }),
     ],
     content: content,
+    immediatelyRender: false,
     onUpdate: ({ editor }) => {
       onContentChange(editor.getHTML());
     },
@@ -143,6 +145,13 @@ export function TiptapEditor({ content, onContentChange, disabled, onEditorReady
         },
     },
   });
+
+  // Sincronizar el estado editable cuando cambia el prop disabled
+  useEffect(() => {
+    if (editor && editor.isEditable !== !disabled) {
+      editor.setEditable(!disabled);
+    }
+  }, [editor, disabled]);
 
   return (
     <div className="border rounded-lg overflow-hidden flex flex-col flex-1">

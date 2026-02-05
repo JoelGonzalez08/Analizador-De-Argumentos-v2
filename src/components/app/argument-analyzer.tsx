@@ -48,6 +48,11 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
@@ -65,6 +70,7 @@ interface ArgumentSuggestion {
   suggestion: string;
   explanation: string;
   applied: boolean;
+  component_index?: number; // Índice del componente relacionado
 }
 
 interface AnalysisResult {
@@ -94,6 +100,9 @@ export function ArgumentAnalyzer() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [lastAnalyzed, setLastAnalyzed] = useState<Date | null>(null);
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState<number | null>(null);
+  const [hoveredComponentId, setHoveredComponentId] = useState<string | null>(null);
+  const [openPopoverId, setOpenPopoverId] = useState<string | null>(null);
+  const [showHighlights, setShowHighlights] = useState(false);
   const [isLoadingConversation, setIsLoadingConversation] = useState(false);
   const editorRef = useRef<Editor | null>(null);
 
@@ -127,6 +136,25 @@ export function ArgumentAnalyzer() {
         });
     }
   }, [isHistoryOpen, conversation, token]);
+
+  // Efecto para aplicar/quitar highlights cuando cambia el toggle
+  useEffect(() => {
+    if (!editorRef.current || !analysisResult) return;
+    
+    if (showHighlights) {
+      // Hacer el editor no editable
+      editorRef.current.setEditable(false);
+      // Aplicar highlights
+      applyHighlights(editorRef.current, analysisResult);
+    } else {
+      // Hacer el editor editable
+      editorRef.current.setEditable(true);
+      // Quitar todos los highlights - recargar contenido limpio
+      const currentContent = editorRef.current.getHTML();
+      const cleanContent = currentContent.replace(/<mark[^>]*>(.*?)<\/mark>/gi, '$1');
+      editorRef.current.commands.setContent(cleanContent);
+    }
+  }, [showHighlights, analysisResult]);
 
   const loadConversation = async (id: number) => {
     if (!token) return;
@@ -374,11 +402,32 @@ export function ArgumentAnalyzer() {
       }
 
       const data = await response.json();
+      
+      // Vincular sugerencias con componentes por texto original
+      if (data.suggestions && data.suggestions.length > 0) {
+        data.suggestions = data.suggestions.map((sug: ArgumentSuggestion) => {
+          // Buscar índice del componente que coincida con el texto original
+          let componentIndex = -1;
+          
+          if (sug.component_type === 'premise') {
+            componentIndex = data.premises.findIndex(
+              (p: ArgumentComponent) => p.text.trim() === sug.original_text.trim()
+            );
+          } else {
+            componentIndex = data.premises.length + data.conclusions.findIndex(
+              (c: ArgumentComponent) => c.text.trim() === sug.original_text.trim()
+            );
+          }
+          
+          return { ...sug, component_index: componentIndex >= 0 ? componentIndex : undefined };
+        });
+      }
+      
       setAnalysisResult(data);
       setLastAnalyzed(new Date());
       
-      // Aplicar resaltado después de análisis
-      if (editorRef.current) {
+      // Aplicar resaltado solo si el toggle está activado
+      if (showHighlights && editorRef.current) {
         applyHighlights(editorRef.current, data);
       }
       
@@ -407,47 +456,119 @@ export function ArgumentAnalyzer() {
   };
   
   const applyHighlights = (editor: Editor, data: AnalysisResult) => {
-    // Primero remover todas las marcas de highlight existentes
-    editor.commands.unsetMark('highlight');
-    
-    // Función auxiliar para encontrar y marcar texto
-    const markText = (text: string, color: string) => {
-      const content = editor.getText();
-      let startIndex = 0;
+    try {
+      // Obtener el texto plano del editor
+      const plainText = editor.getText();
       
-      while ((startIndex = content.indexOf(text, startIndex)) !== -1) {
-        const from = startIndex + 1; // +1 porque ProseMirror usa posiciones base 1
-        const to = from + text.length;
+      // Función para normalizar texto eliminando espacios extras y haciendo case-insensitive
+      const normalizeText = (str: string) => {
+        return str.toLowerCase()
+          .replace(/\s+/g, '') // Eliminar TODOS los espacios para comparación
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, ''); // Eliminar acentos
+      };
+      
+      // Función para encontrar la posición del texto en el contenido
+      const findTextPosition = (searchText: string): { from: number, to: number } | null => {
+        const normalizedPlainText = normalizeText(plainText);
+        const normalizedSearchText = normalizeText(searchText);
         
+        // Buscar sin espacios
+        const searchIndex = normalizedPlainText.indexOf(normalizedSearchText);
+        
+        if (searchIndex === -1) {
+          console.warn('No se encontró el texto:', searchText);
+          return null;
+        }
+        
+        // Ahora encontrar la posición real en el texto original
+        // Contar cuántos caracteres NO-ESPACIO hay antes del match
+        let charsBeforeMatch = 0;
+        let nonSpaceCount = 0;
+        
+        // Contar hasta encontrar la posición donde inicia el match
+        for (let i = 0; i < plainText.length; i++) {
+          const char = plainText[i];
+          const normalized = normalizeText(char);
+          
+          if (normalized !== '') { // Es un caracter significativo
+            if (nonSpaceCount === searchIndex) {
+              charsBeforeMatch = i;
+              break;
+            }
+            nonSpaceCount++;
+          }
+        }
+        
+        // Ahora encontrar cuántos caracteres del texto original necesitamos para cubrir el searchText
+        let charsInMatch = 0;
+        let nonSpaceInMatch = 0;
+        const targetNonSpaceChars = normalizedSearchText.length;
+        
+        for (let i = charsBeforeMatch; i < plainText.length && nonSpaceInMatch < targetNonSpaceChars; i++) {
+          const char = plainText[i];
+          const normalized = normalizeText(char);
+          
+          charsInMatch++;
+          if (normalized !== '') {
+            nonSpaceInMatch++;
+          }
+        }
+        
+        const from = charsBeforeMatch + 1; // Tiptap usa 1-indexed
+        const to = charsBeforeMatch + charsInMatch + 1;
+        
+        console.log(`✓ Posición encontrada para "${searchText.substring(0, 50)}...": from=${from}, to=${to}`);
+        return { from, to };
+      };
+      
+      // Primero recolectar todas las posiciones a marcar
+      const marksToApply: Array<{ from: number, to: number, color: string, type: string }> = [];
+      
+      // Recolectar posiciones de premisas
+      data.premises.forEach((premise, index) => {
+        console.log(`🔍 Buscando premisa ${index + 1}`);
+        const position = findTextPosition(premise.text);
+        if (position) {
+          marksToApply.push({ ...position, color: '#3b82f6', type: 'premise' });
+        }
+      });
+      
+      // Recolectar posiciones de conclusiones
+      data.conclusions.forEach((conclusion, index) => {
+        console.log(`🔍 Buscando conclusión ${index + 1}`);
+        const position = findTextPosition(conclusion.text);
+        if (position) {
+          marksToApply.push({ ...position, color: '#f97316', type: 'conclusion' });
+        }
+      });
+      
+      // Ordenar por posición para aplicar de forma segura
+      marksToApply.sort((a, b) => a.from - b.from);
+      
+      console.log(`📝 Total de componentes encontrados: ${marksToApply.length} (${data.premises.length} premisas + ${data.conclusions.length} conclusiones)`);
+      
+      // Aplicar todos los highlights
+      marksToApply.forEach(mark => {
         try {
           editor.chain()
-            .setTextSelection({ from, to })
-            .setHighlight({ color })
+            .setTextSelection({ from: mark.from, to: mark.to })
+            .setHighlight({ color: mark.color })
             .run();
-          
-          // Solo marcar la primera ocurrencia y salir
-          break;
-        } catch (e) {
-          // Si falla, intentar siguiente ocurrencia
-          startIndex++;
-          continue;
+          console.log(`✅ ${mark.type} resaltada: posición ${mark.from}-${mark.to}`);
+        } catch (err) {
+          console.error(`❌ Error al aplicar highlight en posición ${mark.from}-${mark.to}:`, err);
         }
-      }
-    };
-    
-    // Aplicar marcas a premisas (azul - #3b82f6)
-    data.premises.forEach(premise => {
-      markText(premise.text, '#3b82f6');
-    });
-    
-    // Aplicar marcas a conclusiones (naranja - #f97316)
-    data.conclusions.forEach(conclusion => {
-      markText(conclusion.text, '#f97316');
-    });
-    
-    // Deseleccionar para ver los highlights
-    editor.commands.setTextSelection(0);
-    editor.commands.blur();
+      });
+      
+      // Deseleccionar
+      editor.commands.setTextSelection(0);
+      editor.commands.blur();
+      
+      console.log(`🎨 Resaltado completado. ${marksToApply.length}/${data.premises.length + data.conclusions.length} componentes resaltados`);
+    } catch (error) {
+      console.error('❌ Error al aplicar resaltados:', error);
+    }
   };
   
   const highlightComponent = (index: number) => {
@@ -484,6 +605,7 @@ export function ArgumentAnalyzer() {
     setAnalysisResult(null);
     setLastAnalyzed(null);
     setSelectedSuggestionIndex(null);
+    setShowHighlights(false);
     if (editorRef.current) {
       editorRef.current.chain().clearContent().unsetAllMarks().run();
     }
@@ -572,7 +694,28 @@ export function ArgumentAnalyzer() {
                  </>
                )}
              </div>
-             <div className="flex gap-2">
+             <div className="flex gap-2 items-center">
+               {analysisResult && (
+                 <div className="flex items-center gap-2 px-3 py-2 border rounded-lg bg-muted/50">
+                   <input
+                     type="checkbox"
+                     id="highlight-toggle"
+                     checked={showHighlights}
+                     onChange={(e) => setShowHighlights(e.target.checked)}
+                     className="h-4 w-4 cursor-pointer accent-primary"
+                   />
+                   <label 
+                     htmlFor="highlight-toggle" 
+                     className="text-sm font-medium cursor-pointer select-none flex items-center gap-2"
+                   >
+                     <div className="flex items-center gap-1">
+                       <span className="w-3 h-3 rounded-full bg-blue-500"></span>
+                       <span className="w-3 h-3 rounded-full bg-orange-500"></span>
+                     </div>
+                     Resaltar componentes
+                   </label>
+                 </div>
+               )}
                <Button 
                  variant="outline" 
                  size="sm"
@@ -612,7 +755,7 @@ export function ArgumentAnalyzer() {
                <TiptapEditor
                  content={text}
                  onContentChange={setText}
-                 disabled={isDisabled}
+                 disabled={isDisabled || showHighlights}
                  onEditorReady={(editor) => { editorRef.current = editor; }}
                />
              </CardContent>
@@ -621,10 +764,10 @@ export function ArgumentAnalyzer() {
                  <strong>Palabras:</strong> {wordCount}
                </div>
                <div className='flex gap-2'>
-                 <Button variant="outline" onClick={handleClear} disabled={isDisabled || wordCount === 0}>
+                 <Button variant="outline" onClick={handleClear} disabled={isDisabled || showHighlights || wordCount === 0}>
                    Limpiar
                  </Button>
-                 <Button onClick={handleAnalyze} disabled={isDisabled || wordCount === 0}>
+                 <Button onClick={handleAnalyze} disabled={isDisabled || showHighlights || wordCount === 0}>
                    <Sparkles className="mr-2 h-4 w-4" />
                    {isAnalyzing ? 'Analizando...' : 'Analizar'}
                  </Button>
@@ -635,7 +778,7 @@ export function ArgumentAnalyzer() {
            {/* Right Panel: Components & Suggestions */}
            <div className="flex flex-col gap-6 h-full">
              {/* Top: Argument Components */}
-             <Card className="shadow-lg flex flex-col border-2 max-h-[45vh]">
+             <Card className="shadow-lg flex flex-col border-2 max-h-[55vh]">
                <CardHeader>
                  <CardTitle className='flex items-center gap-2'>
                    <FileText className='h-5 w-5 text-primary' />
@@ -655,10 +798,11 @@ export function ArgumentAnalyzer() {
                        </div>
                      ))}
                    </div>
-                 ) : analysisResult && (analysisResult.premises.length > 0 || analysisResult.conclusions.length > 0) ? (
-                   <div className="space-y-3">
-                     {/* Premisas */}
-                     {analysisResult.premises.length > 0 && (
+                 ) : analysisResult ? (
+                   (analysisResult.premises.length > 0 || analysisResult.conclusions.length > 0) ? (
+                     <div className="space-y-3">
+                       {/* Premisas */}
+                       {analysisResult.premises.length > 0 && (
                        <div className="space-y-2">
                          <h3 className="text-sm font-semibold flex items-center gap-2">
                            <Badge 
@@ -669,15 +813,89 @@ export function ArgumentAnalyzer() {
                            </Badge>
                          </h3>
                          <div className="space-y-2">
-                           {analysisResult.premises.map((premise, index) => (
-                             <div
-                               key={index}
-                               className="p-3 border-2 border-blue-200 dark:border-blue-800 rounded-lg bg-blue-50/50 dark:bg-blue-950/20 hover:border-blue-400 dark:hover:border-blue-600 transition-colors cursor-pointer"
-                               onClick={() => highlightComponent(index)}
-                             >
-                               <p className="text-sm">{premise.text}</p>
-                             </div>
-                           ))}
+                           {analysisResult.premises.map((premise, index) => {
+                             const componentId = `premise-${index}`;
+                             const relatedSuggestion = analysisResult.suggestions.find(s => s.component_index === index);
+                             const hasSuggestion = !!relatedSuggestion;
+                             const isHovered = hoveredComponentId === componentId;
+                             const popoverId = `popover-${componentId}`;
+                             
+                             return (
+                               <Popover 
+                                 key={index}
+                                 open={openPopoverId === popoverId}
+                                 onOpenChange={(open) => {
+                                   setOpenPopoverId(open ? popoverId : null);
+                                   // Hacer scroll a la sugerencia relacionada si existe
+                                   if (open && hasSuggestion) {
+                                     setTimeout(() => {
+                                       const premiseSuggestions = analysisResult.suggestions.filter(s => s.component_type === 'premise');
+                                       const suggestionIdx = premiseSuggestions.findIndex(s => s.component_index === index);
+                                       if (suggestionIdx >= 0) {
+                                         const suggestionElement = document.getElementById(`suggestion-premise-${suggestionIdx}`);
+                                         if (suggestionElement) {
+                                           const scrollContainer = suggestionElement.closest('.overflow-y-auto');
+                                           if (scrollContainer) {
+                                             const containerRect = scrollContainer.getBoundingClientRect();
+                                             const elementRect = suggestionElement.getBoundingClientRect();
+                                             const scrollTop = scrollContainer.scrollTop;
+                                             const offsetTop = elementRect.top - containerRect.top + scrollTop;
+                                             const centerOffset = (containerRect.height - elementRect.height) / 2;
+                                             scrollContainer.scrollTo({
+                                               top: offsetTop - centerOffset,
+                                               behavior: 'smooth'
+                                             });
+                                           }
+                                         }
+                                       }
+                                     }, 100);
+                                   }
+                                 }}
+                               >
+                                 <PopoverTrigger asChild>
+                                   <div
+                                     id={componentId}
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
+                                       isHovered 
+                                         ? 'border-blue-500 bg-blue-100/70 dark:bg-blue-900/40 shadow-lg scale-[1.02]' 
+                                         : 'border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20 hover:border-blue-400 dark:hover:border-blue-600'
+                                     }`}
+                                     onMouseEnter={() => setHoveredComponentId(componentId)}
+                                     onMouseLeave={() => setHoveredComponentId(null)}
+                                   >
+                                     <div className="flex items-start gap-3">
+                                       <Badge 
+                                         variant="outline" 
+                                         className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-blue-400 text-blue-700 dark:text-blue-300 font-bold"
+                                       >
+                                         P{index + 1}
+                                       </Badge>
+                                       <p className="text-sm flex-1">{premise.text}</p>
+                                       {hasSuggestion && (
+                                         <Lightbulb className="h-4 w-4 text-yellow-500 shrink-0 animate-pulse" />
+                                       )}
+                                     </div>
+                                   </div>
+                                 </PopoverTrigger>
+                                 {hasSuggestion && relatedSuggestion && (
+                                   <PopoverContent className="w-96" side="left" align="start">
+                                     <div className="space-y-3">
+                                       <div className="flex items-center gap-2">
+                                         <Badge 
+                                           variant="outline"
+                                           className="h-6 w-6 flex items-center justify-center p-0 border-blue-400 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 font-bold"
+                                         >
+                                           P{index + 1}
+                                         </Badge>
+                                         <h4 className="font-semibold text-sm">Sugerencia para esta premisa</h4>
+                                       </div>
+                                       <p className="text-sm leading-relaxed">{relatedSuggestion.explanation}</p>
+                                     </div>
+                                   </PopoverContent>
+                                 )}
+                               </Popover>
+                             );
+                           })}
                          </div>
                        </div>
                      )}
@@ -694,37 +912,121 @@ export function ArgumentAnalyzer() {
                            </Badge>
                          </h3>
                          <div className="space-y-2">
-                           {analysisResult.conclusions.map((conclusion, index) => (
-                             <div
-                               key={index}
-                               className="p-3 border-2 border-orange-200 dark:border-orange-800 rounded-lg bg-orange-50/50 dark:bg-orange-950/20 hover:border-orange-400 dark:hover:border-orange-600 transition-colors cursor-pointer"
-                               onClick={() => highlightComponent(analysisResult.premises.length + index)}
-                             >
-                               <p className="text-sm">{conclusion.text}</p>
-                             </div>
-                           ))}
+                           {analysisResult.conclusions.map((conclusion, index) => {
+                             const globalIndex = analysisResult.premises.length + index;
+                             const componentId = `conclusion-${index}`;
+                             const relatedSuggestion = analysisResult.suggestions.find(s => s.component_index === globalIndex);
+                             const hasSuggestion = !!relatedSuggestion;
+                             const isHovered = hoveredComponentId === componentId;
+                             const popoverId = `popover-${componentId}`;
+                             
+                             return (
+                               <Popover 
+                                 key={index}
+                                 open={openPopoverId === popoverId}
+                                 onOpenChange={(open) => {
+                                   setOpenPopoverId(open ? popoverId : null);
+                                   // Hacer scroll a la sugerencia relacionada si existe
+                                   if (open && hasSuggestion) {
+                                     setTimeout(() => {
+                                       const conclusionSuggestions = analysisResult.suggestions.filter(s => s.component_type === 'conclusion');
+                                       const suggestionIdx = conclusionSuggestions.findIndex(s => s.component_index === globalIndex);
+                                       if (suggestionIdx >= 0) {
+                                         const suggestionElement = document.getElementById(`suggestion-conclusion-${suggestionIdx}`);
+                                         if (suggestionElement) {
+                                           const scrollContainer = suggestionElement.closest('.overflow-y-auto');
+                                           if (scrollContainer) {
+                                             const containerRect = scrollContainer.getBoundingClientRect();
+                                             const elementRect = suggestionElement.getBoundingClientRect();
+                                             const scrollTop = scrollContainer.scrollTop;
+                                             const offsetTop = elementRect.top - containerRect.top + scrollTop;
+                                             const centerOffset = (containerRect.height - elementRect.height) / 2;
+                                             scrollContainer.scrollTo({
+                                               top: offsetTop - centerOffset,
+                                               behavior: 'smooth'
+                                             });
+                                           }
+                                         }
+                                       }
+                                     }, 100);
+                                   }
+                                 }}
+                               >
+                                 <PopoverTrigger asChild>
+                                   <div
+                                     id={componentId}
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
+                                       isHovered 
+                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]' 
+                                         : 'border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20 hover:border-orange-400 dark:hover:border-orange-600'
+                                     }`}
+                                     onMouseEnter={() => setHoveredComponentId(componentId)}
+                                     onMouseLeave={() => setHoveredComponentId(null)}
+                                   >
+                                     <div className="flex items-start gap-3">
+                                       <Badge 
+                                         variant="outline" 
+                                         className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 font-bold"
+                                       >
+                                         C{index + 1}
+                                       </Badge>
+                                       <p className="text-sm flex-1">{conclusion.text}</p>
+                                       {hasSuggestion && (
+                                         <Lightbulb className="h-4 w-4 text-yellow-500 shrink-0 animate-pulse" />
+                                       )}
+                                     </div>
+                                   </div>
+                                 </PopoverTrigger>
+                                 {hasSuggestion && relatedSuggestion && (
+                                   <PopoverContent className="w-96" side="left" align="start">
+                                     <div className="space-y-3">
+                                       <div className="flex items-center gap-2">
+                                         <Badge 
+                                           variant="outline"
+                                           className="h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 bg-orange-50 dark:bg-orange-950 font-bold"
+                                         >
+                                           C{index + 1}
+                                         </Badge>
+                                         <h4 className="font-semibold text-sm">Sugerencia para esta conclusión</h4>
+                                       </div>
+                                       <p className="text-sm leading-relaxed">{relatedSuggestion.explanation}</p>
+                                     </div>
+                                   </PopoverContent>
+                                 )}
+                               </Popover>
+                             );
+                           })}
                          </div>
                        </div>
                      )}
                    </div>
                  ) : (
-                   <div className="text-muted-foreground flex items-center justify-center gap-2 p-8 border-dashed border-2 rounded-lg h-full">
-                     <AlertCircle className="h-5 w-5" />
-                     <span>Los componentes aparecerán aquí después del análisis.</span>
+                   <div className="text-muted-foreground flex flex-col items-center justify-center gap-3 p-8 border-dashed border-2 rounded-lg h-full">
+                     <AlertCircle className="h-8 w-8 text-yellow-500" />
+                     <div className="text-center space-y-1">
+                       <p className="font-semibold">No se detectaron componentes argumentativos</p>
+                       <p className="text-sm">El texto analizado no contiene premisas ni conclusiones identificables.</p>
+                     </div>
                    </div>
-                 )}
+                 )
+               ) : (
+                 <div className="text-muted-foreground flex items-center justify-center gap-2 p-8 border-dashed border-2 rounded-lg h-full">
+                   <AlertCircle className="h-5 w-5" />
+                   <span>Los componentes aparecerán aquí después del análisis.</span>
+                 </div>
+               )}
                </CardContent>
                {analysisResult && (
                  <CardFooter className="border-t pt-3 text-sm text-muted-foreground">
                    <span>
-                     Total: {analysisResult.total_premises + analysisResult.total_conclusions} componentes
+                     {analysisResult.total_premises} premisas • {analysisResult.total_conclusions} conclusiones detectadas
                    </span>
                  </CardFooter>
                )}
              </Card>
 
              {/* Bottom: Suggestions */}
-             <Card className="shadow-lg flex flex-col border-2 max-h-[45vh]">
+             <Card className="shadow-lg flex flex-col border-2 max-h-[55vh]">
              <CardHeader>
                <div className="flex items-center justify-between">
                  <div>
@@ -749,69 +1051,263 @@ export function ArgumentAnalyzer() {
                      </div>
                    ))}
                  </div>
-               ) : analysisResult && analysisResult.suggestions.length > 0 ? (
-                 <div className="space-y-4">
-                   {analysisResult.suggestions.map((suggestion, index) => (
-                     <div 
-                       key={index}
-                       className={`p-4 border-2 rounded-lg hover:border-primary/50 transition-all cursor-pointer space-y-3 ${
-                         selectedSuggestionIndex === index 
-                           ? 'border-primary bg-primary/5 shadow-lg' 
-                           : ''
-                       }`}
-                       onClick={() => {
-                         setSelectedSuggestionIndex(index);
-                         highlightComponent(index);
-                       }}
-                       onMouseEnter={() => highlightComponent(index)}
-                     >
-                       <div className="flex items-start gap-2">
-                         <Badge 
-                           variant={suggestion.component_type === 'premise' ? 'default' : 'secondary'}
-                           className="mt-1"
-                           style={{
-                             backgroundColor: suggestion.component_type === 'premise' ? '#3b82f6' : '#f97316',
-                             color: 'white'
-                           }}
-                         >
-                           {suggestion.component_type === 'premise' ? 'PREMISA' : 'CONCLUSIÓN'}
-                         </Badge>
-                         <div className="flex-1">
-                           <p className="text-sm text-muted-foreground">
-                             {suggestion.explanation}
-                           </p>
+               ) : analysisResult ? (
+                 analysisResult.suggestions.length > 0 ? (
+                 <div className="space-y-3">
+                   {/* Sugerencias para Premisas */}
+                   {(() => {
+                     const premiseSuggestions = analysisResult.suggestions.filter(s => s.component_type === 'premise');
+                     if (premiseSuggestions.length === 0) return null;
+                     
+                     return (
+                       <div className="space-y-2">
+                         <h3 className="text-sm font-semibold flex items-center gap-2">
+                           <Badge 
+                             variant="default"
+                             style={{ backgroundColor: '#3b82f6', color: 'white' }}
+                           >
+                             SUGERENCIAS - PREMISAS ({premiseSuggestions.length})
+                           </Badge>
+                         </h3>
+                         <div className="space-y-2">
+                           {premiseSuggestions.map((suggestion, idx) => {
+                             const componentId = `premise-${suggestion.component_index}`;
+                             const isHovered = hoveredComponentId === componentId;
+                             const componentLabel = suggestion.component_index !== undefined
+                               ? `P${suggestion.component_index + 1}`
+                               : null;
+                             const popoverId = `popover-suggestion-premise-${idx}`;
+                             const isSelected = openPopoverId === popoverId;
+                             
+                             const relatedComponent = suggestion.component_index !== undefined
+                               ? analysisResult.premises[suggestion.component_index]
+                               : null;
+                             
+                             return (
+                               <Popover 
+                                 key={idx}
+                                 open={isSelected}
+                                 onOpenChange={(open) => {
+                                   setOpenPopoverId(open ? popoverId : null);
+                                   // Hacer scroll al componente relacionado
+                                   if (open && suggestion.component_index !== undefined) {
+                                     setTimeout(() => {
+                                       const componentElement = document.getElementById(`premise-${suggestion.component_index}`);
+                                       if (componentElement) {
+                                         const scrollContainer = componentElement.closest('.overflow-y-auto');
+                                         if (scrollContainer) {
+                                           const containerRect = scrollContainer.getBoundingClientRect();
+                                           const elementRect = componentElement.getBoundingClientRect();
+                                           const scrollTop = scrollContainer.scrollTop;
+                                           const offsetTop = elementRect.top - containerRect.top + scrollTop;
+                                           const centerOffset = (containerRect.height - elementRect.height) / 2;
+                                           scrollContainer.scrollTo({
+                                             top: offsetTop - centerOffset,
+                                             behavior: 'smooth'
+                                           });
+                                         }
+                                       }
+                                     }, 100);
+                                   }
+                                 }}
+                               >
+                                 <PopoverTrigger asChild>
+                                   <div
+                                     id={`suggestion-premise-${idx}`}
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
+                                       isSelected
+                                         ? 'border-blue-500 bg-blue-100/70 dark:bg-blue-900/40 shadow-lg scale-[1.02]'
+                                         : isHovered 
+                                         ? 'border-blue-500 bg-blue-100/70 dark:bg-blue-900/40 shadow-lg scale-[1.02]' 
+                                         : 'border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20 hover:border-blue-400 dark:hover:border-blue-600'
+                                     }`}
+                                     onMouseEnter={() => {
+                                       if (suggestion.component_index !== undefined) {
+                                         setHoveredComponentId(componentId);
+                                       }
+                                     }}
+                                     onMouseLeave={() => setHoveredComponentId(null)}
+                                   >
+                                     <div className="flex items-start gap-3">
+                                       {componentLabel && (
+                                         <Badge 
+                                           variant="outline"
+                                           className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-blue-400 text-blue-700 dark:text-blue-300 font-bold"
+                                         >
+                                           {componentLabel}
+                                         </Badge>
+                                       )}
+                                       <p className="text-sm flex-1 leading-relaxed">{suggestion.explanation}</p>
+                                     </div>
+                                   </div>
+                                 </PopoverTrigger>
+                                 {relatedComponent && (
+                                   <PopoverContent className="w-96" side="right" align="start">
+                                     <div className="space-y-3">
+                                       <div className="flex items-center gap-2">
+                                         {componentLabel && (
+                                           <Badge 
+                                             variant="outline"
+                                             className="h-6 w-6 flex items-center justify-center p-0 border-blue-400 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950 font-bold"
+                                           >
+                                             {componentLabel}
+                                           </Badge>
+                                         )}
+                                         <h4 className="font-semibold text-sm">Premisa relacionada</h4>
+                                       </div>
+                                       <p className="text-sm bg-muted/50 p-3 rounded border leading-relaxed">
+                                         "{relatedComponent.text}"
+                                       </p>
+                                     </div>
+                                   </PopoverContent>
+                                 )}
+                               </Popover>
+                             );
+                           })}
                          </div>
                        </div>
-                       <Button 
-                         size="sm" 
-                         variant="outline"
-                         className="w-full"
-                         disabled={suggestion.applied}
-                         onClick={(e) => e.stopPropagation()}
-                       >
-                         {suggestion.applied ? (
-                           <>
-                             <CheckCircle className="mr-2 h-4 w-4 text-green-600" />
-                             Aplicado
-                           </>
-                         ) : (
-                           'Aplicar Sugerencia'
-                         )}
-                       </Button>
-                     </div>
-                   ))}
+                     );
+                   })()}
+                   
+                   {/* Sugerencias para Conclusiones */}
+                   {(() => {
+                     const conclusionSuggestions = analysisResult.suggestions.filter(s => s.component_type === 'conclusion');
+                     if (conclusionSuggestions.length === 0) return null;
+                     
+                     return (
+                       <div className="space-y-2">
+                         <h3 className="text-sm font-semibold flex items-center gap-2">
+                           <Badge 
+                             variant="secondary"
+                             style={{ backgroundColor: '#f97316', color: 'white' }}
+                           >
+                             SUGERENCIAS - CONCLUSIONES ({conclusionSuggestions.length})
+                           </Badge>
+                         </h3>
+                         <div className="space-y-2">
+                           {conclusionSuggestions.map((suggestion, idx) => {
+                             const componentIndex = suggestion.component_index !== undefined 
+                               ? suggestion.component_index - analysisResult.premises.length 
+                               : -1;
+                             const componentId = `conclusion-${componentIndex}`;
+                             const isHovered = hoveredComponentId === componentId;
+                             const componentLabel = componentIndex >= 0
+                               ? `C${componentIndex + 1}`
+                               : null;
+                             const popoverId = `popover-suggestion-conclusion-${idx}`;
+                             const isSelected = openPopoverId === popoverId;
+                             
+                             const relatedComponent = componentIndex >= 0
+                               ? analysisResult.conclusions[componentIndex]
+                               : null;
+                             
+                             return (
+                               <Popover 
+                                 key={idx}
+                                 open={isSelected}
+                                 onOpenChange={(open) => {
+                                   setOpenPopoverId(open ? popoverId : null);
+                                   // Hacer scroll al componente relacionado
+                                   if (open && componentIndex >= 0) {
+                                     setTimeout(() => {
+                                       const componentElement = document.getElementById(`conclusion-${componentIndex}`);
+                                       if (componentElement) {
+                                         const scrollContainer = componentElement.closest('.overflow-y-auto');
+                                         if (scrollContainer) {
+                                           const containerRect = scrollContainer.getBoundingClientRect();
+                                           const elementRect = componentElement.getBoundingClientRect();
+                                           const scrollTop = scrollContainer.scrollTop;
+                                           const offsetTop = elementRect.top - containerRect.top + scrollTop;
+                                           const centerOffset = (containerRect.height - elementRect.height) / 2;
+                                           scrollContainer.scrollTo({
+                                             top: offsetTop - centerOffset,
+                                             behavior: 'smooth'
+                                           });
+                                         }
+                                       }
+                                     }, 100);
+                                   }
+                                 }}
+                               >
+                                 <PopoverTrigger asChild>
+                                   <div
+                                     id={`suggestion-conclusion-${idx}`}
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
+                                       isSelected
+                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]'
+                                         : isHovered 
+                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]' 
+                                         : 'border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20 hover:border-orange-400 dark:hover:border-orange-600'
+                                     }`}
+                                     onMouseEnter={() => {
+                                       if (componentIndex >= 0) {
+                                         setHoveredComponentId(componentId);
+                                       }
+                                     }}
+                                     onMouseLeave={() => setHoveredComponentId(null)}
+                                   >
+                                     <div className="flex items-start gap-3">
+                                       {componentLabel && (
+                                         <Badge 
+                                           variant="outline"
+                                           className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 font-bold"
+                                         >
+                                           {componentLabel}
+                                         </Badge>
+                                       )}
+                                       <p className="text-sm flex-1 leading-relaxed">{suggestion.explanation}</p>
+                                     </div>
+                                   </div>
+                                 </PopoverTrigger>
+                                 {relatedComponent && (
+                                   <PopoverContent className="w-96" side="right" align="start">
+                                     <div className="space-y-3">
+                                       <div className="flex items-center gap-2">
+                                         {componentLabel && (
+                                           <Badge 
+                                             variant="outline"
+                                             className="h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 bg-orange-50 dark:bg-orange-950 font-bold"
+                                           >
+                                             {componentLabel}
+                                           </Badge>
+                                         )}
+                                         <h4 className="font-semibold text-sm">Conclusión relacionada</h4>
+                                       </div>
+                                       <p className="text-sm bg-muted/50 p-3 rounded border leading-relaxed">
+                                         "{relatedComponent.text}"
+                                       </p>
+                                     </div>
+                                   </PopoverContent>
+                                 )}
+                               </Popover>
+                             );
+                           })}
+                         </div>
+                       </div>
+                     );
+                   })()}
                  </div>
                ) : (
+                 <div className="text-muted-foreground flex flex-col items-center justify-center gap-3 p-8 border-dashed border-2 rounded-lg h-full">
+                   <Lightbulb className="h-8 w-8 text-yellow-500" />
+                   <div className="text-center space-y-1">
+                     <p className="font-semibold">No hay sugerencias disponibles</p>
+                     <p className="text-sm">No se generaron sugerencias de mejora para este texto.</p>
+                   </div>
+                 </div>
+               )
+             ) : (
                  <div className="text-muted-foreground flex items-center justify-center gap-2 p-8 border-dashed border-2 rounded-lg h-full">
                    <AlertCircle className="h-5 w-5" />
                    <span>Las sugerencias aparecerán aquí después del análisis.</span>
                  </div>
-               )}
+               )
+             }
              </CardContent>
              {analysisResult && (
                <CardFooter className="border-t pt-3 flex items-center justify-between text-sm text-muted-foreground">
                  <span>
-                   {analysisResult.total_premises} premisas • {analysisResult.total_conclusions} conclusiones detectadas
+                   Total: {analysisResult.suggestions.length} sugerencias
                  </span>
                  {lastAnalyzed && (
                    <span className="flex items-center gap-1">
