@@ -120,7 +120,13 @@ interface TiptapEditorProps {
 export function TiptapEditor({ content, onContentChange, disabled, onEditorReady }: TiptapEditorProps) {
   const editor = useEditor({
     extensions: [
-      StarterKit,
+      StarterKit.configure({
+        paragraph: {
+          HTMLAttributes: {
+            class: 'mb-4', // Añade margen entre párrafos
+          },
+        },
+      }),
       Highlight.configure({
         multicolor: true,
         HTMLAttributes: {

@@ -4,9 +4,6 @@
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
-// Log para debugging
-console.log('🔗 API_BASE_URL configurada:', API_BASE_URL);
-
 // ==================== TYPES ====================
 export interface AnalysisRequest {
   text: string;
@@ -200,6 +197,7 @@ export async function getConversationAnalyses(
   total_conclusions: number;
   analyzed_at: string;
   created_at: string;
+  spec?: string | any;
   components?: Array<{
     id: number;
     analysis_id: number;

@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
+import { Progress } from '@/components/ui/progress';
 import { useToast } from '@/hooks/use-toast';
 import { useAuth } from '@/contexts/auth-context';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -29,6 +30,8 @@ import {
   History,
   X,
   FileText,
+  BarChart,
+  TrendingUp,
 } from 'lucide-react';
 import { TiptapEditor } from './tiptap-editor';
 import type { Editor } from '@tiptap/react';
@@ -73,6 +76,18 @@ interface ArgumentSuggestion {
   component_index?: number; // Índice del componente relacionado
 }
 
+interface ParagraphAnalysis {
+  paragraph_index: number;
+  text: string;
+  word_count: number;
+  premises_count: number;
+  conclusions_count: number;
+  density: number;
+  strength: 'débil' | 'moderada' | 'fuerte' | 'muy fuerte';
+  strength_score: number;
+  recommendation?: string;
+}
+
 interface AnalysisResult {
   premises: ArgumentComponent[];
   conclusions: ArgumentComponent[];
@@ -80,6 +95,7 @@ interface AnalysisResult {
   total_premises: number;
   total_conclusions: number;
   analyzed_at: string;
+    paragraph_analysis?: ParagraphAnalysis[];
 }
 
 export function ArgumentAnalyzer() {
@@ -99,6 +115,7 @@ export function ArgumentAnalyzer() {
   const [analysisResult, setAnalysisResult] = useState<AnalysisResult | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [lastAnalyzed, setLastAnalyzed] = useState<Date | null>(null);
+  const [lastAnalyzedText, setLastAnalyzedText] = useState<string>('');
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState<number | null>(null);
   const [hoveredComponentId, setHoveredComponentId] = useState<string | null>(null);
   const [openPopoverId, setOpenPopoverId] = useState<string | null>(null);
@@ -139,9 +156,38 @@ export function ArgumentAnalyzer() {
 
   // Efecto para aplicar/quitar highlights cuando cambia el toggle
   useEffect(() => {
-    if (!editorRef.current || !analysisResult) return;
+    if (!editorRef.current || !analysisResult) {
+      return;
+    }
     
     if (showHighlights) {
+      // Verificar que el texto del editor coincide con el texto analizado
+      const currentContent = editorRef.current.getHTML();
+      const currentPlainText = currentContent
+        .replace(/<\/p>/gi, '\n\n')
+        .replace(/<br\s*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+        .replace(/\n\n+/g, '\n\n')
+        .trim();
+      
+      // Función para normalizar texto para comparación
+      const normalizeForComparison = (str: string) => {
+        return str.toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/\s+/g, ' ')
+          .trim();
+      };
+      
+      if (lastAnalyzedText && normalizeForComparison(currentPlainText) !== normalizeForComparison(lastAnalyzedText)) {
+        toast({
+          variant: 'destructive',
+          title: 'Texto modificado',
+          description: 'El texto en el editor ha cambiado desde el último análisis. Algunos componentes pueden no resaltarse correctamente. Analiza nuevamente para obtener resultados precisos.',
+          duration: 6000,
+        });
+      }
+      
       // Hacer el editor no editable
       editorRef.current.setEditable(false);
       // Aplicar highlights
@@ -169,61 +215,153 @@ export function ArgumentAnalyzer() {
       const analyses = await getConversationAnalyses(id, token);
       setConversationAnalyses(analyses);
       
-      // Cargar el último mensaje de la conversación si existe
-      if (data.messages && data.messages.length > 0) {
-        const lastMessage = data.messages[data.messages.length - 1];
-        if (lastMessage.role === 'user') {
-          // Set text in editor
-          const content = `<p>${lastMessage.content}</p>`;
-          setText(content);
-          
-          // Wait for editor to be ready and set content
-          setTimeout(() => {
-            if (editorRef.current) {
-              editorRef.current.commands.setContent(content);
-            }
-          }, 100);
-        }
-        
-        // Cargar el último análisis si existe
-        if (analyses.length > 0) {
+      // Cargar el último análisis si existe PRIMERO para obtener el texto original
+      if (analyses.length > 0) {
           const lastAnalysis = analyses[0]; // El endpoint devuelve ordenado por fecha desc
           
+          // Parsear el spec para obtener toda la información
+          let specData: any = null;
+          let originalText = '';
+          let specSuggestions: any[] = [];
+          let specParagraphAnalysis: any[] = [];
+          
+          if (lastAnalysis.spec) {
+            try {
+              specData = typeof lastAnalysis.spec === 'string' 
+                ? JSON.parse(lastAnalysis.spec) 
+                : lastAnalysis.spec;
+              
+              // Obtener texto original del spec
+              if (specData.original_text) {
+                originalText = specData.original_text;
+              } else if (specData.text) {
+                originalText = specData.text;
+              }
+              
+              // Obtener sugerencias del spec
+              if (specData.suggestions && Array.isArray(specData.suggestions)) {
+                specSuggestions = specData.suggestions;
+              }
+              
+              // Obtener evaluación por párrafo del spec
+              if (specData.paragraph_analysis && Array.isArray(specData.paragraph_analysis)) {
+                specParagraphAnalysis = specData.paragraph_analysis;
+              }
+            } catch (e) {
+              // Error parseando spec
+            }
+          }
+          
+          // Si no hay texto original en spec, usar el mensaje del usuario
+          if (!originalText && data.messages && data.messages.length > 0) {
+            const lastMessage = data.messages[data.messages.length - 1];
+            if (lastMessage.role === 'user') {
+              originalText = lastMessage.content;
+            }
+          }
+          
+          // Cargar el texto en el editor
+          if (originalText) {
+            // Dividir por párrafos (doble salto de línea o más)
+            const paragraphs = originalText.split(/\n\n+/);
+            const content = paragraphs
+              .map(para => {
+                // Cada párrafo puede tener saltos de línea simples que deben preservarse
+                const lines = para.split('\n').filter(line => line.trim());
+                if (lines.length === 0) return '';
+                if (lines.length === 1) return `<p>${lines[0]}</p>`;
+                // Si hay múltiples líneas en el mismo párrafo, unirlas con <br>
+                return `<p>${lines.join('<br>')}</p>`;
+              })
+              .filter(p => p)
+              .join('');
+            setText(content);
+            
+            setTimeout(() => {
+              if (editorRef.current) {
+                editorRef.current.commands.setContent(content);
+                editorRef.current.setEditable(true);
+              }
+            }, 100);
+          }
+          
           // Construir el resultado del análisis
+          const premises = lastAnalysis.components?.filter((c: any) => {
+            const type = c.component_type?.toUpperCase?.() || c.component_type;
+            return type === 'PREMISE';
+          }).map((c: any) => ({
+            type: 'premise' as const,
+            text: c.text,
+            tokens: c.tokens || [],
+            start_pos: c.start_pos,
+            end_pos: c.end_pos
+          })) || [];
+          
+          const conclusions = lastAnalysis.components?.filter((c: any) => {
+            const type = c.component_type?.toUpperCase?.() || c.component_type;
+            return type === 'CONCLUSION';
+          }).map((c: any) => ({
+            type: 'conclusion' as const,
+            text: c.text,
+            tokens: c.tokens || [],
+            start_pos: c.start_pos,
+            end_pos: c.end_pos
+          })) || [];
+          
+          // Usar sugerencias del spec si están disponibles, sino del análisis directo
+          const rawSuggestions = specSuggestions.length > 0 ? specSuggestions : (lastAnalysis.suggestions || []);
+          
+          const suggestions = rawSuggestions.map((s: any) => {
+            const type = s.component_type?.toLowerCase();
+            let componentIndex = -1;
+            
+            // Buscar índice del componente que coincida con el texto original
+            if (type === 'premise') {
+              componentIndex = premises.findIndex(
+                (p: any) => p.text.trim() === s.original_text?.trim()
+              );
+            } else if (type === 'conclusion') {
+              const conclusionIndex = conclusions.findIndex(
+                (c: any) => c.text.trim() === s.original_text?.trim()
+              );
+              if (conclusionIndex >= 0) {
+                componentIndex = premises.length + conclusionIndex;
+              }
+            }
+            
+            return {
+              component_type: (type === 'premise' || type === 'conclusion' ? type : 'premise') as 'premise' | 'conclusion',
+              original_text: s.original_text || '',
+              suggestion: s.suggestion || s.suggestion_text || '',
+              explanation: s.explanation || '',
+              applied: s.applied || false,
+              component_index: componentIndex >= 0 ? componentIndex : undefined
+            };
+          });
+          
+          // Procesar paragraph_analysis si existe
+          const paragraphAnalysis = specParagraphAnalysis.length > 0 
+            ? specParagraphAnalysis.map((p: any, idx: number) => ({
+                paragraph_index: idx,
+                text: p.text || '',
+                strength: p.strength || 'débil',
+                premises_count: p.premises_count || 0,
+                conclusions_count: p.conclusions_count || 0,
+                word_count: p.word_count || 0,
+                density: p.density || 0,
+                strength_score: p.strength_score || 0,
+                recommendation: p.recommendation || undefined
+              }))
+            : undefined;
+          
           const result: AnalysisResult = {
-            premises: lastAnalysis.components?.filter((c: any) => {
-              const type = c.component_type?.toUpperCase?.() || c.component_type;
-              return type === 'PREMISE';
-            }).map((c: any) => ({
-              type: 'premise' as const,
-              text: c.text,
-              tokens: c.tokens || [],
-              start_pos: c.start_pos,
-              end_pos: c.end_pos
-            })) || [],
-            conclusions: lastAnalysis.components?.filter((c: any) => {
-              const type = c.component_type?.toUpperCase?.() || c.component_type;
-              return type === 'CONCLUSION';
-            }).map((c: any) => ({
-              type: 'conclusion' as const,
-              text: c.text,
-              tokens: c.tokens || [],
-              start_pos: c.start_pos,
-              end_pos: c.end_pos
-            })) || [],
-            suggestions: (lastAnalysis.suggestions || lastAnalysis.llm_communications)?.map((s: any) => {
-              const type = s.component_type?.toLowerCase();
-              return {
-                component_type: (type === 'premise' || type === 'conclusion' ? type : 'premise') as 'premise' | 'conclusion',
-                original_text: s.original_text || '',
-                suggestion: s.suggestion_text || '',
-                explanation: s.explanation || '',
-                applied: s.applied || false
-              };
-            }) || [],
-            total_premises: lastAnalysis.total_premises,
-            total_conclusions: lastAnalysis.total_conclusions,
-            analyzed_at: lastAnalysis.analyzed_at
+            premises,
+            conclusions,
+            suggestions,
+            total_premises: lastAnalysis.total_premises || premises.length,
+            total_conclusions: lastAnalysis.total_conclusions || conclusions.length,
+            analyzed_at: lastAnalysis.analyzed_at,
+            paragraph_analysis: paragraphAnalysis
           };
           
           setAnalysisResult(result);
@@ -231,15 +369,13 @@ export function ArgumentAnalyzer() {
           const dateString = lastAnalysis.analyzed_at || lastAnalysis.created_at;
           const analyzedDate = new Date(dateString);
           setLastAnalyzed(analyzedDate);
+          // Guardar el texto analizado para validación
+          setLastAnalyzedText(originalText);
           
-          // Aplicar resaltado después de cargar el análisis
-          setTimeout(() => {
-            if (editorRef.current) {
-              applyHighlights(editorRef.current, result);
-            }
-          }, 300);
+          // NO aplicar resaltado automáticamente - dejar que el usuario lo active manualmente
+          // Esto permite que el editor sea editable al cargar
+          setShowHighlights(false);
         }
-      }
     } catch (error) {
       toast({
         variant: 'destructive',
@@ -357,7 +493,7 @@ export function ArgumentAnalyzer() {
         setConversation(newConv);
         setEditTitle(newConv.title);
         currentConversation = newConv;
-        router.push(`/analyzer?conversation=${newConv.id}`, { shallow: true });
+        router.push(`/analyzer?conversation=${newConv.id}`);
       } catch (error) {
         toast({
           variant: 'destructive',
@@ -372,7 +508,13 @@ export function ArgumentAnalyzer() {
     setAnalysisResult(null);
 
     try {
-      const plainText = text.replace(/<[^>]+>/g, ' ').trim();
+      // Convertir HTML a texto plano preservando párrafos con doble salto de línea
+      const plainText = text
+        .replace(/<\/p>/gi, '\n\n')  // Convertir cierre de párrafo a doble salto de línea
+        .replace(/<br\s*\/?>/gi, '\n')  // Convertir <br> a salto de línea simple
+        .replace(/<[^>]+>/g, '')  // Eliminar el resto de etiquetas HTML
+        .replace(/\n\n+/g, '\n\n')  // Normalizar múltiples saltos de línea a doble
+        .trim();
       
       const response = await fetch(`${API_BASE_URL}/api/arguments/complete-analysis`, {
         method: 'POST',
@@ -425,6 +567,7 @@ export function ArgumentAnalyzer() {
       
       setAnalysisResult(data);
       setLastAnalyzed(new Date());
+      setLastAnalyzedText(plainText);
       
       // Aplicar resaltado solo si el toggle está activado
       if (showHighlights && editorRef.current) {
@@ -460,104 +603,113 @@ export function ArgumentAnalyzer() {
       // Obtener el texto plano del editor
       const plainText = editor.getText();
       
-      // Función para normalizar texto eliminando espacios extras y haciendo case-insensitive
-      const normalizeText = (str: string) => {
+      // Función más agresiva para normalizar: quitar todo excepto letras y números
+      const normalizeForSearch = (str: string) => {
         return str.toLowerCase()
-          .replace(/\s+/g, '') // Eliminar TODOS los espacios para comparación
           .normalize('NFD')
-          .replace(/[\u0300-\u036f]/g, ''); // Eliminar acentos
+          .replace(/[\u0300-\u036f]/g, '') // Quitar acentos
+          // PRIMERO: normalizar contracciones expandidas ANTES de quitar espacios
+          .replace(/\bde\s+el\b/g, 'del')  // "de el" → "del"
+          .replace(/\ba\s+el\b/g, 'al')    // "a el" → "al"
+          .replace(/\bde\s+la\b/g, 'dela')  // "de la" → "dela"
+          .replace(/\ba\s+la\b/g, 'ala')    // "a la" → "ala"
+          // Normalizar espacios alrededor de puntuación (ej: " , " → ",")
+          .replace(/\s*([.,;:!?¿¡\-()"""''])\s*/g, '$1')
+          // LUEGO: quitar espacios
+          .replace(/\s+/g, '')
+          // FINALMENTE: quitar puntuación
+          .replace(/[.,;:!?¿¡\-()"""'']/g, '')
+          .trim();
       };
       
-      // Función para encontrar la posición del texto en el contenido
-      const findTextPosition = (searchText: string): { from: number, to: number } | null => {
-        const normalizedPlainText = normalizeText(plainText);
-        const normalizedSearchText = normalizeText(searchText);
+      // Función para encontrar la posición del texto
+      const findTextPosition = (searchText: string, componentType: string, index: number): { from: number, to: number } | null => {
+        const searchNormalized = normalizeForSearch(searchText);
+        const editorNormalized = normalizeForSearch(plainText);
         
-        // Buscar sin espacios
-        const searchIndex = normalizedPlainText.indexOf(normalizedSearchText);
+        // Buscar la posición normalizada
+        const normalizedIndex = editorNormalized.indexOf(searchNormalized);
         
-        if (searchIndex === -1) {
-          console.warn('No se encontró el texto:', searchText);
+        if (normalizedIndex === -1) {
           return null;
         }
         
-        // Ahora encontrar la posición real en el texto original
-        // Contar cuántos caracteres NO-ESPACIO hay antes del match
-        let charsBeforeMatch = 0;
-        let nonSpaceCount = 0;
+        // Mapear la posición normalizada al texto original
+        let charCount = 0;
+        let startIndex = 0;
         
-        // Contar hasta encontrar la posición donde inicia el match
+        // Encontrar el inicio
         for (let i = 0; i < plainText.length; i++) {
-          const char = plainText[i];
-          const normalized = normalizeText(char);
-          
-          if (normalized !== '') { // Es un caracter significativo
-            if (nonSpaceCount === searchIndex) {
-              charsBeforeMatch = i;
-              break;
-            }
-            nonSpaceCount++;
+          const normalized = normalizeForSearch(plainText.substring(0, i + 1));
+          if (normalized.length > normalizedIndex) {
+            startIndex = i - (normalized.length - normalizedIndex - 1);
+            break;
           }
         }
         
-        // Ahora encontrar cuántos caracteres del texto original necesitamos para cubrir el searchText
-        let charsInMatch = 0;
-        let nonSpaceInMatch = 0;
-        const targetNonSpaceChars = normalizedSearchText.length;
+        // Encontrar el final contando caracteres normalizados
+        let endIndex = startIndex;
+        let currentNormalizedLength = 0;
         
-        for (let i = charsBeforeMatch; i < plainText.length && nonSpaceInMatch < targetNonSpaceChars; i++) {
-          const char = plainText[i];
-          const normalized = normalizeText(char);
-          
-          charsInMatch++;
-          if (normalized !== '') {
-            nonSpaceInMatch++;
-          }
+        while (currentNormalizedLength < searchNormalized.length && endIndex < plainText.length) {
+          endIndex++;
+          const segment = plainText.substring(startIndex, endIndex);
+          currentNormalizedLength = normalizeForSearch(segment).length;
         }
         
-        const from = charsBeforeMatch + 1; // Tiptap usa 1-indexed
-        const to = charsBeforeMatch + charsInMatch + 1;
+        const from = startIndex + 1; // Tiptap usa 1-indexed
+        const to = endIndex + 1;
         
-        console.log(`✓ Posición encontrada para "${searchText.substring(0, 50)}...": from=${from}, to=${to}`);
         return { from, to };
       };
       
       // Primero recolectar todas las posiciones a marcar
-      const marksToApply: Array<{ from: number, to: number, color: string, type: string }> = [];
+      const marksToApply: Array<{ from: number, to: number, color: string, type: string, index: number }> = [];
       
-      // Recolectar posiciones de premisas
+      // Recolectar posiciones de premisas con colores alternados
       data.premises.forEach((premise, index) => {
-        console.log(`🔍 Buscando premisa ${index + 1}`);
-        const position = findTextPosition(premise.text);
+        const position = findTextPosition(premise.text, 'premisa', index);
         if (position) {
-          marksToApply.push({ ...position, color: '#3b82f6', type: 'premise' });
+          // Alternar entre tonos de azul para diferenciar premisas consecutivas
+          const color = index % 2 === 0 ? '#60a5fa' : '#3b82f6'; // azul más claro y azul normal
+          marksToApply.push({ ...position, color, type: 'premise', index });
         }
       });
       
-      // Recolectar posiciones de conclusiones
+      // Recolectar posiciones de conclusiones con colores alternados
       data.conclusions.forEach((conclusion, index) => {
-        console.log(`🔍 Buscando conclusión ${index + 1}`);
-        const position = findTextPosition(conclusion.text);
+        const position = findTextPosition(conclusion.text, 'conclusión', index);
         if (position) {
-          marksToApply.push({ ...position, color: '#f97316', type: 'conclusion' });
+          // Alternar entre tonos de naranja para diferenciar conclusiones consecutivas
+          const color = index % 2 === 0 ? '#fb923c' : '#f97316'; // naranja más claro y naranja normal
+          marksToApply.push({ ...position, color, type: 'conclusion', index });
         }
       });
       
       // Ordenar por posición para aplicar de forma segura
       marksToApply.sort((a, b) => a.from - b.from);
       
-      console.log(`📝 Total de componentes encontrados: ${marksToApply.length} (${data.premises.length} premisas + ${data.conclusions.length} conclusiones)`);
-      
-      // Aplicar todos los highlights
-      marksToApply.forEach(mark => {
+      // Aplicar todos los highlights con un pequeño espaciado entre componentes consecutivos
+      marksToApply.forEach((mark, idx) => {
         try {
+          let adjustedFrom = mark.from;
+          let adjustedTo = mark.to;
+          
+          // Si hay un componente anterior muy cerca (menos de 3 caracteres de distancia)
+          // ajustar el inicio para dejar un pequeño espacio visual
+          if (idx > 0) {
+            const prevMark = marksToApply[idx - 1];
+            if (mark.from - prevMark.to < 3) {
+              adjustedFrom = Math.max(mark.from, prevMark.to + 1);
+            }
+          }
+          
           editor.chain()
-            .setTextSelection({ from: mark.from, to: mark.to })
+            .setTextSelection({ from: adjustedFrom, to: adjustedTo })
             .setHighlight({ color: mark.color })
             .run();
-          console.log(`✅ ${mark.type} resaltada: posición ${mark.from}-${mark.to}`);
         } catch (err) {
-          console.error(`❌ Error al aplicar highlight en posición ${mark.from}-${mark.to}:`, err);
+          // Error al aplicar highlight
         }
       });
       
@@ -565,9 +717,21 @@ export function ArgumentAnalyzer() {
       editor.commands.setTextSelection(0);
       editor.commands.blur();
       
-      console.log(`🎨 Resaltado completado. ${marksToApply.length}/${data.premises.length + data.conclusions.length} componentes resaltados`);
+      const totalExpected = data.premises.length + data.conclusions.length;
+      const totalFound = marksToApply.length;
+      
+      // Mostrar advertencia si faltan componentes
+      if (totalFound < totalExpected) {
+        const missing = totalExpected - totalFound;
+        toast({
+          variant: 'default',
+          title: `${totalFound}/${totalExpected} componentes resaltados`,
+          description: `No se pudieron resaltar ${missing} componente(s). Esto suele ocurrir cuando el texto del editor difiere del texto analizado. Considera analizar nuevamente.`,
+          duration: 5000,
+        });
+      }
     } catch (error) {
-      console.error('❌ Error al aplicar resaltados:', error);
+      // Error al aplicar resaltados
     }
   };
   
@@ -604,6 +768,7 @@ export function ArgumentAnalyzer() {
     setText('');
     setAnalysisResult(null);
     setLastAnalyzed(null);
+    setLastAnalyzedText('');
     setSelectedSuggestionIndex(null);
     setShowHighlights(false);
     if (editorRef.current) {
@@ -739,7 +904,7 @@ export function ArgumentAnalyzer() {
          </CardContent>
        </Card>
        
-       <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-6 items-start">
+       <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
            {/* Left Panel: Editor */}
            <Card className="shadow-lg flex flex-col border-2 h-full">
              <CardHeader>
@@ -751,7 +916,7 @@ export function ArgumentAnalyzer() {
                  Escribe o pega tu texto argumentativo aquí.
                </CardDescription>
              </CardHeader>
-             <CardContent className='flex-1 flex flex-col min-h-[400px]'>
+             <CardContent className='flex-1 flex flex-col min-h-0'>
                <TiptapEditor
                  content={text}
                  onContentChange={setText}
@@ -778,7 +943,7 @@ export function ArgumentAnalyzer() {
            {/* Right Panel: Components & Suggestions */}
            <div className="flex flex-col gap-6 h-full">
              {/* Top: Argument Components */}
-             <Card className="shadow-lg flex flex-col border-2 max-h-[55vh]">
+             <Card className="shadow-lg flex flex-col border-2 flex-1 min-h-0">
                <CardHeader>
                  <CardTitle className='flex items-center gap-2'>
                    <FileText className='h-5 w-5 text-primary' />
@@ -819,6 +984,11 @@ export function ArgumentAnalyzer() {
                              const hasSuggestion = !!relatedSuggestion;
                              const isHovered = hoveredComponentId === componentId;
                              const popoverId = `popover-${componentId}`;
+                             // Color alternado para cada premisa
+                             const bgColor = index % 2 === 0 ? 'bg-blue-100/70 dark:bg-blue-900/40' : 'bg-blue-50/50 dark:bg-blue-950/20';
+                             const borderColor = index % 2 === 0 ? 'border-blue-300 dark:border-blue-700' : 'border-blue-200 dark:border-blue-800';
+                             const hoverBorderColor = index % 2 === 0 ? 'hover:border-blue-500 dark:hover:border-blue-500' : 'hover:border-blue-400 dark:hover:border-blue-600';
+                             const indexBadgeBg = index % 2 === 0 ? 'bg-blue-500' : 'bg-blue-600';
                              
                              return (
                                <Popover 
@@ -857,8 +1027,8 @@ export function ArgumentAnalyzer() {
                                      id={componentId}
                                      className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
                                        isHovered 
-                                         ? 'border-blue-500 bg-blue-100/70 dark:bg-blue-900/40 shadow-lg scale-[1.02]' 
-                                         : 'border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20 hover:border-blue-400 dark:hover:border-blue-600'
+                                         ? `border-blue-500 ${bgColor} shadow-lg scale-[1.02]` 
+                                         : `${borderColor} ${bgColor} ${hoverBorderColor}`
                                      }`}
                                      onMouseEnter={() => setHoveredComponentId(componentId)}
                                      onMouseLeave={() => setHoveredComponentId(null)}
@@ -866,7 +1036,7 @@ export function ArgumentAnalyzer() {
                                      <div className="flex items-start gap-3">
                                        <Badge 
                                          variant="outline" 
-                                         className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-blue-400 text-blue-700 dark:text-blue-300 font-bold"
+                                         className={`shrink-0 h-6 w-6 flex items-center justify-center p-0 ${indexBadgeBg} text-white font-bold border-0`}
                                        >
                                          P{index + 1}
                                        </Badge>
@@ -920,6 +1090,20 @@ export function ArgumentAnalyzer() {
                              const isHovered = hoveredComponentId === componentId;
                              const popoverId = `popover-${componentId}`;
                              
+                             // Alternar colores para conclusiones (naranja claro/oscuro)
+                             const bgColor = index % 2 === 0 
+                               ? 'bg-orange-400/20 dark:bg-orange-400/10' 
+                               : 'bg-orange-500/20 dark:bg-orange-500/10';
+                             const borderColor = index % 2 === 0 
+                               ? 'border-orange-400/50 dark:border-orange-400/30' 
+                               : 'border-orange-500/50 dark:border-orange-500/30';
+                             const hoverBorderColor = index % 2 === 0 
+                               ? 'hover:border-orange-400 dark:hover:border-orange-400' 
+                               : 'hover:border-orange-500 dark:hover:border-orange-500';
+                             const indexBadgeBg = index % 2 === 0 
+                               ? 'bg-orange-400 dark:bg-orange-400' 
+                               : 'bg-orange-500 dark:bg-orange-500';
+                             
                              return (
                                <Popover 
                                  key={index}
@@ -955,10 +1139,10 @@ export function ArgumentAnalyzer() {
                                  <PopoverTrigger asChild>
                                    <div
                                      id={componentId}
-                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${bgColor} ${borderColor} ${hoverBorderColor} ${
                                        isHovered 
-                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]' 
-                                         : 'border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20 hover:border-orange-400 dark:hover:border-orange-600'
+                                         ? 'shadow-lg scale-[1.02]' 
+                                         : ''
                                      }`}
                                      onMouseEnter={() => setHoveredComponentId(componentId)}
                                      onMouseLeave={() => setHoveredComponentId(null)}
@@ -966,7 +1150,7 @@ export function ArgumentAnalyzer() {
                                      <div className="flex items-start gap-3">
                                        <Badge 
                                          variant="outline" 
-                                         className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 font-bold"
+                                         className={`shrink-0 h-6 w-6 flex items-center justify-center p-0 border-0 text-white font-bold ${indexBadgeBg}`}
                                        >
                                          C{index + 1}
                                        </Badge>
@@ -1026,7 +1210,7 @@ export function ArgumentAnalyzer() {
              </Card>
 
              {/* Bottom: Suggestions */}
-             <Card className="shadow-lg flex flex-col border-2 max-h-[55vh]">
+             <Card className="shadow-lg flex flex-col border-2 flex-1 min-h-0">
              <CardHeader>
                <div className="flex items-center justify-between">
                  <div>
@@ -1201,6 +1385,20 @@ export function ArgumentAnalyzer() {
                                ? analysisResult.conclusions[componentIndex]
                                : null;
                              
+                             // Alternar colores basados en el índice del componente relacionado
+                             const bgColor = componentIndex % 2 === 0 
+                               ? 'bg-orange-400/20 dark:bg-orange-400/10' 
+                               : 'bg-orange-500/20 dark:bg-orange-500/10';
+                             const borderColor = componentIndex % 2 === 0 
+                               ? 'border-orange-400/50 dark:border-orange-400/30' 
+                               : 'border-orange-500/50 dark:border-orange-500/30';
+                             const hoverBorderColor = componentIndex % 2 === 0 
+                               ? 'hover:border-orange-400 dark:hover:border-orange-400' 
+                               : 'hover:border-orange-500 dark:hover:border-orange-500';
+                             const indexBadgeBg = componentIndex % 2 === 0 
+                               ? 'bg-orange-400 dark:bg-orange-400' 
+                               : 'bg-orange-500 dark:bg-orange-500';
+                             
                              return (
                                <Popover 
                                  key={idx}
@@ -1232,12 +1430,10 @@ export function ArgumentAnalyzer() {
                                  <PopoverTrigger asChild>
                                    <div
                                      id={`suggestion-conclusion-${idx}`}
-                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${
-                                       isSelected
-                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]'
-                                         : isHovered 
-                                         ? 'border-orange-500 bg-orange-100/70 dark:bg-orange-900/40 shadow-lg scale-[1.02]' 
-                                         : 'border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20 hover:border-orange-400 dark:hover:border-orange-600'
+                                     className={`p-3 border-2 rounded-lg transition-all cursor-pointer relative ${bgColor} ${borderColor} ${hoverBorderColor} ${
+                                       isSelected || isHovered
+                                         ? 'shadow-lg scale-[1.02]'
+                                         : ''
                                      }`}
                                      onMouseEnter={() => {
                                        if (componentIndex >= 0) {
@@ -1250,7 +1446,7 @@ export function ArgumentAnalyzer() {
                                        {componentLabel && (
                                          <Badge 
                                            variant="outline"
-                                           className="shrink-0 h-6 w-6 flex items-center justify-center p-0 border-orange-400 text-orange-700 dark:text-orange-300 font-bold"
+                                           className={`shrink-0 h-6 w-6 flex items-center justify-center p-0 border-0 text-white font-bold ${indexBadgeBg}`}
                                          >
                                            {componentLabel}
                                          </Badge>
@@ -1320,6 +1516,116 @@ export function ArgumentAnalyzer() {
            </Card>
          </div>
        </div>
+
+       {/* Paragraph Evaluation Section */}
+       {analysisResult && (
+         <Card className="shadow-lg border-2">
+           <CardHeader>
+             <CardTitle className="flex items-center gap-2">
+               <BarChart className="h-5 w-5 text-primary" />
+               Evaluación Argumentativa por Párrafo
+             </CardTitle>
+             <CardDescription>
+               Análisis de la fuerza argumentativa de cada párrafo
+             </CardDescription>
+           </CardHeader>
+           <CardContent>
+             {analysisResult.paragraph_analysis && analysisResult.paragraph_analysis.length > 0 ? (
+               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+               {analysisResult?.paragraph_analysis?.map((para, idx) => {
+                 const getStrengthColor = (strength: string) => {
+                   switch (strength) {
+                     case 'muy fuerte':
+                       return 'bg-green-500 text-white hover:bg-green-600';
+                     case 'fuerte':
+                       return 'bg-blue-500 text-white hover:bg-blue-600';
+                     case 'moderada':
+                       return 'bg-yellow-500 text-white hover:bg-yellow-600';
+                     case 'débil':
+                       return 'bg-red-500 text-white hover:bg-red-600';
+                     default:
+                       return 'bg-gray-500 text-white hover:bg-gray-600';
+                   }
+                 };
+
+                 const getProgressColor = (score: number) => {
+                   if (score >= 70) return 'bg-green-500';
+                   if (score >= 50) return 'bg-blue-500';
+                   if (score >= 30) return 'bg-yellow-500';
+                   return 'bg-red-500';
+                 };
+
+                 return (
+                   <div key={idx} className="border-2 rounded-lg p-4 hover:border-primary hover:opacity-75 transition-colors">
+                     <div className="flex items-center justify-between mb-3">
+                       <Badge variant="outline" className="font-semibold">
+                         <FileText className="h-3 w-3 mr-1" />
+                         Párrafo {idx + 1}
+                       </Badge>
+                       <Badge className={getStrengthColor(para.strength)}>
+                         <TrendingUp className="h-3 w-3 mr-1" />
+                         {para.strength.charAt(0).toUpperCase() + para.strength.slice(1)}
+                       </Badge>
+                     </div>
+                     
+                     <p className="text-sm text-muted-foreground mb-3 line-clamp-2 leading-relaxed">
+                       {para.text}
+                     </p>
+                     
+                     <div className="grid grid-cols-2 gap-2 mb-3 text-xs">
+                       <div className="flex items-center gap-1">
+                         <Badge variant="outline" className="bg-blue-50 dark:bg-blue-950 border-blue-200">
+                           {para.premises_count} premisas
+                         </Badge>
+                       </div>
+                       <div className="flex items-center gap-1">
+                         <Badge variant="outline" className="bg-orange-50 dark:bg-orange-950 border-orange-200">
+                           {para.conclusions_count} conclusiones
+                         </Badge>
+                       </div>
+                       <div className="text-muted-foreground flex items-center gap-1">
+                         <span>{para.word_count} palabras</span>
+                       </div>
+                       <div className="text-muted-foreground flex items-center gap-1">
+                         <span>{Number((para.density * 100).toFixed(1)) + '% densidad'}</span>
+                       </div>
+                     </div>
+                     
+                     <div className="space-y-2">
+                       <div className="flex items-center justify-between text-xs">
+                         <span className="text-muted-foreground font-medium">Fuerza argumentativa</span>
+                         <span className="font-semibold">{para.strength_score} de 100</span>
+                       </div>
+                       <div className="relative">
+                         <Progress value={para.strength_score} className="h-2" />
+                         <div 
+                           className={`absolute top-0 left-0 h-2 rounded-full transition-all ${getProgressColor(para.strength_score)}`}
+                           style={{ width: para.strength_score + '%' }}
+                         />
+                       </div>
+                     </div>
+                     
+                     {para.recommendation && (
+                       <div className="mt-3 p-2 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded text-xs opacity-90">
+                         <p className="flex items-start gap-2">
+                           <Lightbulb className="h-3 w-3 text-blue-600 dark:text-blue-400 mt-0.5 shrink-0" />
+                           <span className="text-blue-700 dark:text-blue-300">{para.recommendation}</span>
+                         </p>
+                       </div>
+                     )}
+                   </div>
+                 );
+               })}
+             </div>
+             ) : (
+               <div className="text-center py-8 text-muted-foreground">
+                 <BarChart className="h-12 w-12 mx-auto mb-3 opacity-50" />
+                 <p>No hay evaluación de párrafos disponible</p>
+               </div>
+             )}
+           </CardContent>
+         </Card>
+       )}
 
        {/* History Sheet */}
        <Sheet open={isHistoryOpen} onOpenChange={setIsHistoryOpen}>
@@ -1405,59 +1711,159 @@ export function ArgumentAnalyzer() {
                              variant="outline" 
                              className="w-full"
                              onClick={() => {
-                               const content = `<p>${message.content}</p>`;
-                               setText(content);
-                               
-                               // Update editor content
-                               if (editorRef.current) {
-                                 editorRef.current.commands.setContent(content);
-                               }
-                               
-                               // Restore analysis if it exists
                                if (analysis) {
+                                 // Parsear el spec para obtener el texto original y sugerencias
+                                 let specData: any = null;
+                                 let originalText = message.content;
+                                 let specSuggestions: any[] = [];
+                                 let specParagraphAnalysis: any[] = [];
+                                 
+                                 if (analysis.spec) {
+                                   try {
+                                     specData = typeof analysis.spec === 'string' 
+                                       ? JSON.parse(analysis.spec) 
+                                       : analysis.spec;
+                                     
+                                     // Obtener texto original del spec
+                                     if (specData.original_text) {
+                                       originalText = specData.original_text;
+                                     } else if (specData.text) {
+                                       originalText = specData.text;
+                                     }
+                                     
+                                     // Obtener sugerencias del spec
+                                     if (specData.suggestions && Array.isArray(specData.suggestions)) {
+                                       specSuggestions = specData.suggestions;
+                                     }
+                                     
+                                     // Obtener evaluación por párrafo del spec
+                                     if (specData.paragraph_analysis && Array.isArray(specData.paragraph_analysis)) {
+                                       specParagraphAnalysis = specData.paragraph_analysis;
+                                     }
+                                   } catch (e) {
+                                     // Error parseando spec
+                                   }
+                                 }
+                                 
+                                 // Cargar texto en el editor
+                                 const paragraphs = originalText.split(/\n\n+/);
+                                 const content = paragraphs
+                                   .map(para => {
+                                     const lines = para.split('\n').filter(line => line.trim());
+                                     if (lines.length === 0) return '';
+                                     if (lines.length === 1) return `<p>${lines[0]}</p>`;
+                                     return `<p>${lines.join('<br>')}</p>`;
+                                   })
+                                   .filter(p => p)
+                                   .join('');
+                                 setText(content);
+                                 
+                                 if (editorRef.current) {
+                                   editorRef.current.commands.setContent(content);
+                                 }
+                                 
+                                 // Procesar componentes
+                                 const premises = analysis.components?.filter((c: any) => {
+                                   const type = c.component_type?.toUpperCase?.() || c.component_type;
+                                   return type === 'PREMISE';
+                                 }).map((c: any) => ({
+                                   type: 'premise' as const,
+                                   text: c.text,
+                                   tokens: c.tokens || [],
+                                   start_pos: c.start_pos,
+                                   end_pos: c.end_pos
+                                 })) || [];
+                                 
+                                 const conclusions = analysis.components?.filter((c: any) => {
+                                   const type = c.component_type?.toUpperCase?.() || c.component_type;
+                                   return type === 'CONCLUSION';
+                                 }).map((c: any) => ({
+                                   type: 'conclusion' as const,
+                                   text: c.text,
+                                   tokens: c.tokens || [],
+                                   start_pos: c.start_pos,
+                                   end_pos: c.end_pos
+                                 })) || [];
+                                 
+                                 // Usar sugerencias del spec si están disponibles
+                                 const rawSuggestions = specSuggestions.length > 0 ? specSuggestions : (analysis.suggestions || []);
+                                 
+                                 const suggestions = rawSuggestions.map((s: any) => {
+                                   const type = s.component_type?.toLowerCase();
+                                   let componentIndex = -1;
+                                   
+                                   if (type === 'premise') {
+                                     componentIndex = premises.findIndex(
+                                       (p: any) => p.text.trim() === s.original_text?.trim()
+                                     );
+                                   } else if (type === 'conclusion') {
+                                     const conclusionIndex = conclusions.findIndex(
+                                       (c: any) => c.text.trim() === s.original_text?.trim()
+                                     );
+                                     if (conclusionIndex >= 0) {
+                                       componentIndex = premises.length + conclusionIndex;
+                                     }
+                                   }
+                                   
+                                   return {
+                                     component_type: (type === 'premise' || type === 'conclusion' ? type : 'premise') as 'premise' | 'conclusion',
+                                     original_text: s.original_text || '',
+                                     suggestion: s.suggestion || s.suggestion_text || '',
+                                     explanation: s.explanation || '',
+                                     applied: s.applied || false,
+                                     component_index: componentIndex >= 0 ? componentIndex : undefined
+                                   };
+                                 });
+                                 
+                                 // Procesar paragraph_analysis si existe
+                                 const paragraphAnalysis = specParagraphAnalysis.length > 0 
+                                   ? specParagraphAnalysis.map((p: any, idx: number) => ({
+                                       paragraph_index: idx,
+                                       text: p.text || '',
+                                       strength: p.strength || 'débil',
+                                       premises_count: p.premises_count || 0,
+                                       conclusions_count: p.conclusions_count || 0,
+                                       word_count: p.word_count || 0,
+                                       density: p.density || 0,
+                                       strength_score: p.strength_score || 0,
+                                       recommendation: p.recommendation || undefined
+                                     }))
+                                   : undefined;
+                                 
                                  const result: AnalysisResult = {
-                                   premises: analysis.components?.filter((c: any) => c.component_type === 'PREMISE').map((c: any) => ({
-                                     type: 'premise' as const,
-                                     text: c.text,
-                                     tokens: c.tokens || [],
-                                     start_pos: c.start_pos,
-                                     end_pos: c.end_pos
-                                   })) || [],
-                                   conclusions: analysis.components?.filter((c: any) => c.component_type === 'CONCLUSION').map((c: any) => ({
-                                     type: 'conclusion' as const,
-                                     text: c.text,
-                                     tokens: c.tokens || [],
-                                     start_pos: c.start_pos,
-                                     end_pos: c.end_pos
-                                   })) || [],
-                                   suggestions: (analysis.suggestions || analysis.llm_communications)?.map((s: any) => {
-                                     const type = s.component_type?.toLowerCase();
-                                     return {
-                                       component_type: (type === 'premise' || type === 'conclusion' ? type : 'premise') as 'premise' | 'conclusion',
-                                       original_text: s.original_text || '',
-                                       suggestion: s.suggestion_text || '',
-                                       explanation: s.explanation || '',
-                                       applied: s.applied || false
-                                     };
-                                   }) || [],
-                                   total_premises: analysis.total_premises,
-                                   total_conclusions: analysis.total_conclusions,
-                                   analyzed_at: analysis.analyzed_at
+                                   premises,
+                                   conclusions,
+                                   suggestions,
+                                   total_premises: analysis.total_premises || premises.length,
+                                   total_conclusions: analysis.total_conclusions || conclusions.length,
+                                   analyzed_at: analysis.analyzed_at,
+                                   paragraph_analysis: paragraphAnalysis
                                  };
                                  
                                  setAnalysisResult(result);
                                  const dateString = analysis.analyzed_at || analysis.created_at;
                                  const analyzedDate = new Date(dateString);
                                  setLastAnalyzed(analyzedDate);
-                                 
-                                 // Apply highlights after content is set
-                                 setTimeout(() => {
-                                   if (editorRef.current) {
-                                     applyHighlights(editorRef.current, result);
-                                   }
-                                 }, 100);
+                                 setLastAnalyzedText(originalText);
+                                 setShowHighlights(false); // No aplicar highlights automáticamente
                                } else {
-                                 // Clear analysis if no analysis exists for this version
+                                 // Si no hay análisis, solo cargar el texto
+                                 const paragraphs = message.content.split(/\n\n+/);
+                                 const content = paragraphs
+                                   .map(para => {
+                                     const lines = para.split('\n').filter(line => line.trim());
+                                     if (lines.length === 0) return '';
+                                     if (lines.length === 1) return `<p>${lines[0]}</p>`;
+                                     return `<p>${lines.join('<br>')}</p>`;
+                                   })
+                                   .filter(p => p)
+                                   .join('');
+                                 setText(content);
+                                 
+                                 if (editorRef.current) {
+                                   editorRef.current.commands.setContent(content);
+                                 }
+                                 
                                  setAnalysisResult(null);
                                  setLastAnalyzed(null);
                                }
@@ -1490,6 +1896,7 @@ export function ArgumentAnalyzer() {
            </ScrollArea>
          </SheetContent>
        </Sheet>
-    </div>
-  );
+</div>
+   );
 }
+ 

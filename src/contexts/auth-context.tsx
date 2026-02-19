@@ -54,6 +54,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             headers: {
               'Authorization': `Bearer ${storedToken}`,
             },
+            signal: AbortSignal.timeout(5000), // 5 second timeout
           });
 
           if (!response.ok) {
@@ -68,9 +69,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             localStorage.setItem('auth_user', JSON.stringify(userData));
           }
         } catch (error) {
-          console.error('Error verifying token (backend may be offline):', error);
-          // Keep stored user data even if backend is unreachable
-          // This allows the app to work with cached data when backend is down
+          // Silently handle network errors - keep cached user data
+          // This allows the app to work offline with cached data
         }
       }
 
@@ -120,7 +120,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
       router.push('/analyzer');
     } catch (error) {
-      console.error('Login error:', error);
       throw error;
     }
   };
@@ -143,7 +142,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       // After registration, login automatically
       await login(username, password);
     } catch (error) {
-      console.error('Registration error:', error);
       throw error;
     }
   };
@@ -159,7 +157,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         });
       }
     } catch (error) {
-      console.error('Logout error:', error);
+      // Error en logout
     } finally {
       setToken(null);
       setUser(null);
@@ -190,7 +188,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(updatedUser);
       localStorage.setItem('auth_user', JSON.stringify(updatedUser));
     } catch (error) {
-      console.error('Update error:', error);
       throw error;
     }
   };

@@ -250,9 +250,6 @@ export default function Home() {
               <h2 className="text-3xl font-bold tracking-tighter sm:text-4xl md:text-5xl">
                 ¿Listo para Mejorar tus Argumentos?
               </h2>
-              <p className="max-w-[600px] text-muted-foreground md:text-xl">
-                Únete a cientos de usuarios que ya están fortaleciendo sus textos con IA.
-              </p>
             </div>
             <Button 
               size="lg" 
